@@ -179,21 +179,33 @@ jobs:
             echo "${MYSQL_SHA256}  ${RUNNER_TEMP}/mysql.tar.gz" | sha256sum --check -
           fi
           tar -xzf "$RUNNER_TEMP/mysql.tar.gz" -C "$RUNNER_TEMP"
-          test -f "$src/CMakeLists.txt"
+          if [ ! -f "$src/CMakeLists.txt" ]; then
+            echo "Unexpected source layout: no CMakeLists.txt in $src" >&2
+            ls -la "$RUNNER_TEMP" >&2
+            exit 1
+          fi
 
-          # WITH_BOOST is mandatory for 8.0.x; the mysql-boost tarball carries the
-          # exact Boost release this MySQL version expects.
-          boost_root="$(find "$src" -maxdepth 3 -type d -name 'boost_1_*' -print -quit)"
-          test -n "$boost_root"
-          test -f "$boost_root/boost/version.hpp"
-          echo "BOOST_PACKAGE=$(basename "$boost_root")" >> "$GITHUB_ENV"
-          echo "Using bundled Boost at $boost_root"
+          # WITH_BOOST is mandatory for 8.0.x. Point it at the boost directory of
+          # the mysql-boost tarball and let MySQL's own boost.cmake resolve what is
+          # inside it: it accepts a boost_1_xx_0 subdirectory, a boost tarball, or
+          # boost/version.hpp sitting directly in that directory.
+          boost_dir="$src/boost"
+          if [ ! -d "$boost_dir" ]; then
+            echo "No boost directory in $src; is this the mysql-boost tarball?" >&2
+            ls -la "$src" >&2
+            exit 1
+          fi
+          echo "Contents of $boost_dir:"
+          ls -la "$boost_dir"
+          boost_package="$(find "$boost_dir" -maxdepth 1 -name 'boost_1_*' \
+            -exec basename '{}' \; | head -n 1 || true)"
+          echo "BOOST_PACKAGE=${boost_package:-bundled}" >> "$GITHUB_ENV"
 
           cmake -S "$src" -B "$RUNNER_TEMP/build" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DINSTALL_LAYOUT=STANDALONE \
-            -DWITH_BOOST="$boost_root" \
+            -DWITH_BOOST="$boost_dir" \
             -DWITH_SSL="$OPENSSL_PREFIX" \
             -DWITH_ZLIB=bundled \
             -DWITH_ZSTD=bundled \
