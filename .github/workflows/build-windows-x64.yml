@@ -1,0 +1,394 @@
+name: Windows x64
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+    inputs:
+      mysql_version:
+        description: 'MySQL version to build, for example 8.0.25'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MYSQL_VERSION: 8.0.25
+  MYSQL_SHA256: ''
+  # MySQL 8.0.25 requires OpenSSL 1.x; 1.1.x release tags keep the old naming.
+  OPENSSL_VERSION: 1.1.1w
+  OPENSSL_TAG: OpenSSL_1_1_1w
+  PACKAGE_PLATFORM: windows-x64
+  # Short roots keep the MySQL source and build trees clear of MAX_PATH limits.
+  SOURCE_ROOT: C:\mysql-src
+  BUILD_ROOT: C:\mysql-build
+  OPENSSL_ROOT: C:\openssl-x64
+  INSTALL_PREFIX: C:\mysql
+
+jobs:
+  windows-x64:
+    name: Windows x64 / MSVC
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up MSVC x64 environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Resolve build inputs
+        id: resolve
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.mysql_version }}
+        run: |
+          $version = $env:MYSQL_VERSION
+          if ($env:INPUT_VERSION) {
+            $version = $env:INPUT_VERSION
+          }
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Unexpected MySQL version: $version"
+          }
+          $series = ($version -split '\.')[0..1] -join '.'
+          Add-Content -Path $env:GITHUB_ENV -Value "MYSQL_VERSION=$version"
+          Add-Content -Path $env:GITHUB_ENV -Value "MYSQL_SERIES=$series"
+          # 8.0.x does not ship Boost in the plain source tarball (that starts
+          # with 8.3), so the mysql-boost distribution is the one to fetch.
+          Add-Content -Path $env:GITHUB_ENV -Value `
+            "MYSQL_TARBALL=mysql-boost-$version.tar.gz"
+          Add-Content -Path $env:GITHUB_ENV -Value `
+            "PACKAGE_NAME=mysql-$version-$env:PACKAGE_PLATFORM"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$version"
+
+      - name: Verify Windows toolchain
+        shell: pwsh
+        run: |
+          $required = 'cl', 'link', 'nmake', 'dumpbin', 'cmake', 'curl', 'tar'
+          foreach ($tool in $required) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+              throw "Required tool not found: $tool"
+            }
+          }
+          $perl = @(
+            'C:\Strawberry\perl\bin\perl.exe',
+            'C:\Strawberry\bin\perl.exe'
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $perl) {
+            throw 'Strawberry Perl was not found on the Windows runner.'
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path -Parent $perl)
+          Add-Content -Path $env:GITHUB_ENV -Value "PERL_EXECUTABLE=$perl"
+          cl 2>&1 | Select-Object -First 2
+          cmake --version | Select-Object -First 1
+          & $perl -v | Select-String 'This is perl'
+
+      # MySQL needs bison; winflexbison ships it as win_bison.exe, so it is also
+      # exposed under the name MySQL's CMake looks for.
+      - name: Install bison
+        shell: pwsh
+        run: |
+          choco install winflexbison3 --yes --no-progress
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Failed to install winflexbison3.'
+          }
+          $winBison = Get-Command win_bison.exe -ErrorAction SilentlyContinue
+          if (-not $winBison) {
+            throw 'win_bison.exe was not found after installing winflexbison3.'
+          }
+          $bisonDirectory = Join-Path $env:RUNNER_TEMP 'bison'
+          New-Item -ItemType Directory -Force -Path $bisonDirectory | Out-Null
+          $bison = Join-Path $bisonDirectory 'bison.exe'
+          Copy-Item -LiteralPath $winBison.Source -Destination $bison -Force
+          Add-Content -Path $env:GITHUB_PATH -Value $bisonDirectory
+          Add-Content -Path $env:GITHUB_ENV -Value `
+            "BISON_EXECUTABLE=$($bison -replace '\\', '/')"
+          & $bison --version | Select-Object -First 1
+
+      # Pinned OpenSSL, same version as the Linux artifacts. MySQL copies the DLLs
+      # next to the binaries, so the package does not need a system OpenSSL.
+      - name: Build pinned OpenSSL
+        shell: pwsh
+        run: |
+          $version = $env:OPENSSL_VERSION
+          $archive = Join-Path $env:RUNNER_TEMP "openssl-$version.tar.gz"
+          $sourceRoot = Join-Path $env:RUNNER_TEMP 'openssl'
+          Remove-Item -LiteralPath $sourceRoot, $env:OPENSSL_ROOT `
+            -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $sourceRoot | Out-Null
+
+          curl.exe -L --fail --retry 5 --retry-delay 5 --retry-connrefused `
+            "https://github.com/openssl/openssl/releases/download/$env:OPENSSL_TAG/openssl-$version.tar.gz" `
+            -o $archive
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Failed to download the OpenSSL source.'
+          }
+          tar.exe -xzf $archive -C $sourceRoot
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Failed to extract the OpenSSL source.'
+          }
+
+          Push-Location (Join-Path $sourceRoot "openssl-$version")
+          & $env:PERL_EXECUTABLE Configure VC-WIN64A shared no-asm `
+            "--prefix=$env:OPENSSL_ROOT" "--openssldir=$env:OPENSSL_ROOT\ssl"
+          if ($LASTEXITCODE -ne 0) {
+            throw 'OpenSSL Configure failed.'
+          }
+          nmake
+          if ($LASTEXITCODE -ne 0) {
+            throw 'OpenSSL build failed.'
+          }
+          nmake install_sw
+          if ($LASTEXITCODE -ne 0) {
+            throw 'OpenSSL installation failed.'
+          }
+          Pop-Location
+
+          $expected = @(
+            "$env:OPENSSL_ROOT\include\openssl\ssl.h",
+            "$env:OPENSSL_ROOT\lib\libssl.lib",
+            "$env:OPENSSL_ROOT\lib\libcrypto.lib",
+            "$env:OPENSSL_ROOT\bin\libssl-1_1-x64.dll",
+            "$env:OPENSSL_ROOT\bin\libcrypto-1_1-x64.dll",
+            "$env:OPENSSL_ROOT\bin\openssl.exe"
+          )
+          foreach ($file in $expected) {
+            if (-not (Test-Path -LiteralPath $file)) {
+              throw "Missing OpenSSL build output: $file"
+            }
+          }
+          & "$env:OPENSSL_ROOT\bin\openssl.exe" version
+
+      - name: Download MySQL source
+        shell: pwsh
+        run: |
+          $version = $env:MYSQL_VERSION
+          $archive = Join-Path $env:RUNNER_TEMP $env:MYSQL_TARBALL
+          # Current releases live under Downloads/, older ones move to archives/.
+          $bases = @(
+            "https://cdn.mysql.com/Downloads/MySQL-$env:MYSQL_SERIES",
+            "https://cdn.mysql.com/archives/mysql-$env:MYSQL_SERIES"
+          )
+          $downloaded = $false
+          foreach ($base in $bases) {
+            curl.exe -L --fail --retry 5 --retry-delay 5 --retry-connrefused `
+              "$base/$env:MYSQL_TARBALL" -o $archive
+            if ($LASTEXITCODE -eq 0) {
+              Write-Output "Downloaded $base/$env:MYSQL_TARBALL"
+              $downloaded = $true
+              break
+            }
+          }
+          if (-not $downloaded) {
+            throw 'Failed to download the MySQL source.'
+          }
+          if ($env:MYSQL_SHA256) {
+            $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -ne $env:MYSQL_SHA256.ToLowerInvariant()) {
+              throw "MySQL source checksum mismatch: $hash"
+            }
+          }
+
+          Remove-Item -LiteralPath $env:SOURCE_ROOT -Recurse -Force `
+            -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $env:SOURCE_ROOT | Out-Null
+          tar.exe -xzf $archive -C $env:SOURCE_ROOT
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Failed to extract the MySQL source.'
+          }
+          $source = Join-Path $env:SOURCE_ROOT "mysql-$version"
+          if (-not (Test-Path -LiteralPath (Join-Path $source 'CMakeLists.txt'))) {
+            throw 'The MySQL source tree was not extracted as expected.'
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value `
+            "MYSQL_SOURCE=$($source -replace '\\', '/')"
+
+          # WITH_BOOST is mandatory for 8.0.x; the mysql-boost tarball carries the
+          # exact Boost release this MySQL version expects.
+          $boost = Get-ChildItem -LiteralPath $source -Recurse -Depth 2 -Directory `
+            -Filter 'boost_1_*' | Select-Object -First 1
+          if (-not $boost) {
+            throw 'The bundled Boost directory was not found in the MySQL source.'
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $boost.FullName 'boost\version.hpp'))) {
+            throw "Boost headers are missing under $($boost.FullName)."
+          }
+          Write-Output "Using bundled Boost at $($boost.FullName)"
+          Add-Content -Path $env:GITHUB_ENV -Value "BOOST_PACKAGE=$($boost.Name)"
+          Add-Content -Path $env:GITHUB_ENV -Value `
+            "BOOST_ROOT_DIR=$($boost.FullName -replace '\\', '/')"
+
+      - name: Configure and build MySQL
+        shell: pwsh
+        run: |
+          cmake -S "$env:MYSQL_SOURCE" -B "$env:BUILD_ROOT" `
+            -G 'Visual Studio 17 2022' -A x64 `
+            "-DCMAKE_INSTALL_PREFIX=$($env:INSTALL_PREFIX -replace '\\', '/')" `
+            "-DWITH_SSL=$($env:OPENSSL_ROOT -replace '\\', '/')" `
+            "-DWITH_BOOST=$env:BOOST_ROOT_DIR" `
+            "-DBISON_EXECUTABLE=$env:BISON_EXECUTABLE" `
+            -DWITH_ZLIB=bundled `
+            -DWITH_ZSTD=bundled `
+            -DWITH_LZ4=bundled `
+            -DWITH_ICU=bundled `
+            -DWITH_PROTOBUF=bundled `
+            -DWITH_UNIT_TESTS=OFF `
+            -DWITH_ROUTER=OFF
+          if ($LASTEXITCODE -ne 0) {
+            throw 'CMake configuration failed.'
+          }
+          cmake --build "$env:BUILD_ROOT" --config Release --parallel
+          if ($LASTEXITCODE -ne 0) {
+            throw 'The MySQL build failed.'
+          }
+
+      - name: Stage and verify Windows artifact
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP $env:PACKAGE_NAME
+          Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+          cmake --install "$env:BUILD_ROOT" --config Release --prefix $stage
+          if ($LASTEXITCODE -ne 0) {
+            throw 'The MySQL installation step failed.'
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value "STAGE_DIRECTORY=$stage"
+
+          foreach ($file in @('bin\mysqld.exe', 'bin\mysql.exe', 'bin\mysqladmin.exe')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $stage $file))) {
+              throw "Missing from the staged package: $file"
+            }
+          }
+          if (-not (Get-ChildItem -LiteralPath $stage -Recurse -Filter 'libssl-1_1-x64.dll')) {
+            throw 'The bundled OpenSSL DLLs are missing from the staged package.'
+          }
+          $headers = (dumpbin /headers "$stage\bin\mysqld.exe" | Out-String)
+          if ($headers -notmatch 'machine \(x64\)') {
+            throw 'The build is not a Windows x64 executable.'
+          }
+          & "$stage\bin\mysqld.exe" --version
+          if ($LASTEXITCODE -ne 0) {
+            throw 'mysqld.exe --version failed.'
+          }
+
+      - name: Start mysqld and run a smoke test
+        shell: pwsh
+        run: |
+          $stage = $env:STAGE_DIRECTORY
+          $data = Join-Path $env:RUNNER_TEMP 'data'
+          $stdout = Join-Path $env:RUNNER_TEMP 'mysqld.out'
+          $stderr = Join-Path $env:RUNNER_TEMP 'mysqld.err'
+          $port = 13306
+          Remove-Item -LiteralPath $data -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $data | Out-Null
+
+          & "$stage\bin\mysqld.exe" --initialize-insecure --console `
+            "--basedir=$stage" "--datadir=$data"
+          if ($LASTEXITCODE -ne 0) {
+            throw 'mysqld --initialize-insecure failed.'
+          }
+
+          $server = Start-Process -FilePath "$stage\bin\mysqld.exe" -PassThru -NoNewWindow `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr `
+            -ArgumentList '--console', "--basedir=$stage", "--datadir=$data", `
+              "--port=$port", '--loose-mysqlx=OFF'
+          try {
+            $ready = $false
+            foreach ($attempt in 1..60) {
+              & "$stage\bin\mysqladmin.exe" --protocol=tcp --host=127.0.0.1 `
+                "--port=$port" --user=root ping 2>$null | Out-Null
+              if ($LASTEXITCODE -eq 0) {
+                $ready = $true
+                break
+              }
+              Start-Sleep -Seconds 2
+            }
+            if (-not $ready) {
+              Get-Content -LiteralPath $stderr, $stdout -ErrorAction SilentlyContinue
+              throw 'mysqld did not become ready.'
+            }
+            & "$stage\bin\mysql.exe" --protocol=tcp --host=127.0.0.1 "--port=$port" `
+              --user=root --execute="SELECT VERSION(), @@version_compile_machine, @@version_compile_os;"
+            if ($LASTEXITCODE -ne 0) {
+              throw 'The MySQL client could not query the server.'
+            }
+            # Proves the bundled OpenSSL is usable at runtime, not just linkable.
+            & "$stage\bin\mysql.exe" --protocol=tcp --host=127.0.0.1 "--port=$port" `
+              --user=root --ssl-mode=REQUIRED --execute="SHOW STATUS LIKE 'Ssl_cipher';"
+            if ($LASTEXITCODE -ne 0) {
+              throw 'A TLS connection using the bundled OpenSSL failed.'
+            }
+          } finally {
+            & "$stage\bin\mysqladmin.exe" --protocol=tcp --host=127.0.0.1 `
+              "--port=$port" --user=root shutdown 2>$null | Out-Null
+            if (-not $server.HasExited) {
+              Start-Sleep -Seconds 10
+            }
+            if (-not $server.HasExited) {
+              Stop-Process -Id $server.Id -Force
+            }
+          }
+
+      - name: Package the Windows artifact
+        shell: pwsh
+        run: |
+          $stage = $env:STAGE_DIRECTORY
+          $buildInfo = @"
+          package_platform=$env:PACKAGE_PLATFORM
+          mysql_version=$env:MYSQL_VERSION
+          openssl_version=$env:OPENSSL_VERSION
+          boost=$env:BOOST_PACKAGE
+          architecture=x64
+          compiler=MSVC
+          cmake=$(cmake --version | Select-Object -First 1)
+          runner_image=windows-2022
+          install_prefix=$env:INSTALL_PREFIX
+          "@
+          $buildInfo.Trim() | Set-Content -LiteralPath "$stage\BUILD-ENVIRONMENT.txt" `
+            -Encoding ascii
+
+          New-Item -ItemType Directory -Force -Path 'dist' | Out-Null
+          $archive = Join-Path $env:GITHUB_WORKSPACE "dist\$env:PACKAGE_NAME.zip"
+          Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+          tar.exe -a -c -f $archive -C $env:RUNNER_TEMP $env:PACKAGE_NAME
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Failed to create the ZIP archive.'
+          }
+
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $([System.IO.Path]::GetFileName($archive))" |
+            Set-Content -LiteralPath "$archive.sha256" -Encoding ascii
+
+          $entries = tar.exe -tf $archive
+          if ($LASTEXITCODE -ne 0) {
+            throw 'The generated ZIP archive could not be listed.'
+          }
+          if (-not ($entries | Where-Object { $_ -like '*/bin/mysqld.exe' })) {
+            throw 'mysqld.exe is missing from the generated ZIP archive.'
+          }
+          Get-ChildItem -LiteralPath 'dist' | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: |
+            dist/${{ env.PACKAGE_NAME }}.zip
+            dist/${{ env.PACKAGE_NAME }}.zip.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+

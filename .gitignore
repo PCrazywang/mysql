@@ -1,0 +1,20 @@
+# MySQL编译产出
+bin/
+lib/*.a
+lib/*.so
+lib/*.so.*
+
+# 构建临时文件
+build/
+cmake-build-*/
+*.o
+*.lo
+*.la
+*.so
+*.a
+
+# 日志、临时文件
+*.log
+*.tmp
+*.swp
+.DS_Store

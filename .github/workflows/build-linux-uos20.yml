@@ -1,0 +1,403 @@
+name: Linux ARM64 (UOS 20 compatible)
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+    inputs:
+      mysql_version:
+        description: 'MySQL version to build, for example 8.0.25'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MYSQL_VERSION: 8.0.25
+  MYSQL_SHA256: ''
+  # MySQL 8.0.25 requires OpenSSL 1.x (cmake/ssl.cmake only accepts major
+  # version 1), so 3.x cannot be used here. OpenSSL 1.1.x release tags keep the
+  # old OpenSSL_1_1_1x naming, hence the separate tag variable.
+  OPENSSL_VERSION: 1.1.1w
+  OPENSSL_TAG: OpenSSL_1_1_1w
+  # /opt/rh/gcc-toolset-10 is what MySQL 8.0.25's own CMakeLists looks for on el8.
+  GCC_TOOLSET: gcc-toolset-10
+  PREFIX: /usr/local/mysql
+  MAX_GLIBC: '2.28'
+  MAX_GLIBCXX: '3.4.25'
+
+jobs:
+  build:
+    name: ARM64 / EL8 glibc 2.28 (UOS 20 ABI baseline)
+    runs-on: ubuntu-22.04-arm
+    container: almalinux:8
+    timeout-minutes: 360
+    env:
+      PACKAGE_PLATFORM: arm64-uos20
+
+    steps:
+      # UOS 20, Debian 10 and EL8 share glibc 2.28, but UOS 20's own GCC 8.3 is
+      # not what this MySQL release is built with: on el8 its CMakeLists looks
+      # for /opt/rh/gcc-toolset-10, which is the toolchain Oracle used for 8.0.
+      - name: Install EL8 build toolchain
+        run: |
+          set -eu
+          dnf -y install epel-release
+          # group_replication generates XDR code with rpcgen, which el8 keeps in
+          # the disabled powertools repo, and needs the tirpc headers located via
+          # pkg-config because el8 glibc no longer ships rpc/rpc.h.
+          dnf -y --enablerepo=powertools install \
+            "${GCC_TOOLSET}-gcc" "${GCC_TOOLSET}-gcc-c++" "${GCC_TOOLSET}-binutils" \
+            cmake make bison patchelf pkgconf-pkg-config \
+            rpcgen libtirpc-devel \
+            libaio-devel ncurses-devel \
+            perl perl-IPC-Cmd perl-Data-Dumper \
+            curl tar gzip xz git file findutils diffutils which procps-ng rpm
+          dnf clean all
+
+      - uses: actions/checkout@v6
+
+      - name: Confirm UOS 20-compatible build baseline
+        run: |
+          set -eu
+          source "/opt/rh/${GCC_TOOLSET}/enable"
+          test "$(uname -m)" = 'aarch64'
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc $MAX_GLIBC"
+          test "$(gcc -dumpversion)" = "${GCC_TOOLSET##*-}"
+          cat /etc/os-release
+          rpm -qf /
+          gcc --version | head -n 1
+          cmake --version | head -n 1
+          bison --version | head -n 1
+          patchelf --version
+          command -v rpcgen
+          pkg-config --modversion libtirpc
+
+      - name: Resolve build inputs
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.mysql_version }}
+        run: |
+          set -eu
+          version="$MYSQL_VERSION"
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            version="$INPUT_VERSION"
+          fi
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "Unexpected MySQL version: $version" >&2; exit 1 ;;
+          esac
+          {
+            echo "MYSQL_VERSION=$version"
+            echo "MYSQL_SERIES=${version%.*}"
+            # 8.0.x does not ship Boost in the plain source tarball (that starts
+            # with 8.3), so the mysql-boost distribution is the one to fetch.
+            echo "MYSQL_TARBALL=mysql-boost-${version}.tar.gz"
+            echo "PACKAGE_NAME=mysql-${version}-linux-${PACKAGE_PLATFORM}"
+            echo "OPENSSL_PREFIX=${RUNNER_TEMP}/openssl-install"
+          } >> "$GITHUB_ENV"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Pinned OpenSSL: MySQL copies a custom OpenSSL into lib/private and sets an
+      # $ORIGIN rpath, so the artifact does not use the target system's OpenSSL.
+      - name: Build pinned OpenSSL
+        run: |
+          set -eu
+          source "/opt/rh/${GCC_TOOLSET}/enable"
+          src="$RUNNER_TEMP/openssl-${OPENSSL_VERSION}"
+          rm -rf "$src" "$OPENSSL_PREFIX"
+
+          curl --fail --location --retry 5 --retry-delay 5 \
+            --retry-connrefused \
+            "https://github.com/openssl/openssl/releases/download/${OPENSSL_TAG}/openssl-${OPENSSL_VERSION}.tar.gz" \
+            --output "$RUNNER_TEMP/openssl.tar.gz"
+          tar -xzf "$RUNNER_TEMP/openssl.tar.gz" -C "$RUNNER_TEMP"
+
+          cd "$src"
+          ./Configure \
+            --prefix="$OPENSSL_PREFIX" \
+            --openssldir=/etc/ssl \
+            --libdir=lib \
+            shared
+          make -j"$(nproc)"
+          make install_sw
+
+          test -f "$OPENSSL_PREFIX/lib/libssl.so.1.1"
+          test -f "$OPENSSL_PREFIX/lib/libcrypto.so.1.1"
+          LD_LIBRARY_PATH="$OPENSSL_PREFIX/lib" "$OPENSSL_PREFIX/bin/openssl" version
+
+      - name: Configure and build MySQL
+        run: |
+          set -eu
+          source "/opt/rh/${GCC_TOOLSET}/enable"
+          src="$RUNNER_TEMP/mysql-${MYSQL_VERSION}"
+          rm -rf "$src" "$RUNNER_TEMP/build"
+
+          # Current releases live under Downloads/, older ones move to archives/.
+          downloaded=0
+          for base in "https://cdn.mysql.com/Downloads/MySQL-${MYSQL_SERIES}" \
+                      "https://cdn.mysql.com/archives/mysql-${MYSQL_SERIES}"; do
+            if curl --fail --location --retry 5 --retry-delay 5 \
+                --retry-connrefused \
+                "${base}/${MYSQL_TARBALL}" \
+                --output "$RUNNER_TEMP/mysql.tar.gz"; then
+              echo "Downloaded ${base}/${MYSQL_TARBALL}"
+              downloaded=1
+              break
+            fi
+          done
+          test "$downloaded" -eq 1
+          if [ -n "$MYSQL_SHA256" ]; then
+            echo "${MYSQL_SHA256}  ${RUNNER_TEMP}/mysql.tar.gz" | sha256sum --check -
+          fi
+          tar -xzf "$RUNNER_TEMP/mysql.tar.gz" -C "$RUNNER_TEMP"
+          test -f "$src/CMakeLists.txt"
+
+          # WITH_BOOST is mandatory for 8.0.x; the mysql-boost tarball carries the
+          # exact Boost release this MySQL version expects.
+          boost_root="$(find "$src" -maxdepth 3 -type d -name 'boost_1_*' -print -quit)"
+          test -n "$boost_root"
+          test -f "$boost_root/boost/version.hpp"
+          echo "BOOST_PACKAGE=$(basename "$boost_root")" >> "$GITHUB_ENV"
+          echo "Using bundled Boost at $boost_root"
+
+          cmake -S "$src" -B "$RUNNER_TEMP/build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+            -DINSTALL_LAYOUT=STANDALONE \
+            -DWITH_BOOST="$boost_root" \
+            -DWITH_SSL="$OPENSSL_PREFIX" \
+            -DWITH_ZLIB=bundled \
+            -DWITH_ZSTD=bundled \
+            -DWITH_LZ4=bundled \
+            -DWITH_ICU=bundled \
+            -DWITH_PROTOBUF=bundled \
+            -DWITH_EDITLINE=bundled \
+            -DWITH_UNIT_TESTS=OFF \
+            -DWITH_ROUTER=OFF \
+            -DWITH_SYSTEMD=OFF \
+            -DWITH_NUMA=OFF
+          cmake --build "$RUNNER_TEMP/build" --parallel "$(nproc)"
+          df -h "$RUNNER_TEMP" | tail -n 1
+
+      - name: Stage and verify UOS 20-compatible artifact
+        run: |
+          set -eu
+          src="$RUNNER_TEMP/mysql-${MYSQL_VERSION}"
+          stage="$RUNNER_TEMP/$PACKAGE_NAME"
+          prefix="$stage$PREFIX"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+
+          DESTDIR="$stage" cmake --install "$RUNNER_TEMP/build"
+          for doc in LICENSE README; do
+            if [ -f "$src/$doc" ]; then
+              install -m 0644 "$src/$doc" "$stage/$doc"
+            fi
+          done
+
+          test -x "$prefix/bin/mysqld"
+          "$prefix/bin/mysqld" --version
+          "$prefix/bin/mysql" --version
+          file "$prefix/bin/mysqld"
+          readelf -h "$prefix/bin/mysqld" | grep -E 'Machine:.*AArch64'
+
+          if ldd "$prefix/bin/mysqld" | grep -q 'not found'; then
+            ldd "$prefix/bin/mysqld"
+            exit 1
+          fi
+
+          ssl_libraries="$(ldd "$prefix/bin/mysqld" | grep -E 'libssl|libcrypto' || true)"
+          test -n "$ssl_libraries"
+          if printf '%s\n' "$ssl_libraries" | grep -v "$stage" | grep -q .; then
+            echo 'OpenSSL must be resolved from the package itself, not from the system.' >&2
+            printf '%s\n' "$ssl_libraries"
+            exit 1
+          fi
+
+          scan_dirs="$prefix/bin $prefix/lib"
+          symbols="$RUNNER_TEMP/symbols.txt"
+          { find $scan_dirs -type f -exec readelf --version-info '{}' \; || true; } \
+            2>/dev/null > "$symbols"
+
+          max_glibc="$(grep -o 'GLIBC_[0-9.]*' "$symbols" | sed 's/GLIBC_//' \
+            | sort -Vu | tail -n 1)"
+          test -n "$max_glibc"
+          test "$(printf '%s\n' "$MAX_GLIBC" "$max_glibc" | sort -V | tail -n 1)" \
+            = "$MAX_GLIBC"
+          echo "Maximum required glibc symbol: GLIBC_${max_glibc}"
+
+          max_glibcxx="$(grep -o 'GLIBCXX_[0-9.]*' "$symbols" | sed 's/GLIBCXX_//' \
+            | sort -Vu | tail -n 1)"
+          if [ -n "$max_glibcxx" ]; then
+            test "$(printf '%s\n' "$MAX_GLIBCXX" "$max_glibcxx" | sort -V | tail -n 1)" \
+              = "$MAX_GLIBCXX"
+            echo "Maximum required libstdc++ symbol: GLIBCXX_${max_glibcxx}"
+          fi
+
+          # Red Hat backported __libc_single_threaded into glibc 2.28 while upstream
+          # added it in 2.32, so a reference to it would break on UOS 20 / Debian 10.
+          if { find $scan_dirs -type f -exec readelf --dyn-syms '{}' \; || true; } \
+              2>/dev/null | grep -q '__libc_single_threaded'; then
+            echo 'Binaries reference __libc_single_threaded, which upstream glibc 2.28 does not export.' >&2
+            exit 1
+          fi
+
+          cat > "$stage/BUILD-ENVIRONMENT.txt" <<EOF
+          package_platform=linux-${PACKAGE_PLATFORM}
+          mysql_version=${MYSQL_VERSION}
+          openssl_version=${OPENSSL_VERSION}
+          boost=${BOOST_PACKAGE}
+          machine=$(uname -m)
+          glibc=$(getconf GNU_LIBC_VERSION)
+          gcc=$(source "/opt/rh/${GCC_TOOLSET}/enable" && gcc -dumpfullversion)
+          cmake=$(cmake --version | head -n 1)
+          kernel=$(uname -sr)
+          build_container=almalinux:8
+          install_prefix=${PREFIX}
+          max_glibc_symbol=GLIBC_${max_glibc}
+          EOF
+
+          mkdir -p dist
+          tar -czf "dist/${PACKAGE_NAME}.tar.gz" -C "$RUNNER_TEMP" "$PACKAGE_NAME"
+          sha256sum "dist/${PACKAGE_NAME}.tar.gz" \
+            > "dist/${PACKAGE_NAME}.tar.gz.sha256"
+          tar -tzf "dist/${PACKAGE_NAME}.tar.gz" >/dev/null
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: |
+            dist/${{ env.PACKAGE_NAME }}.tar.gz
+            dist/${{ env.PACKAGE_NAME }}.tar.gz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  # The artifact is built on EL8 for the toolchain, but it has to run on the real
+  # UOS 20 ABI baseline, so it is installed and started inside Debian 10.
+  verify-uos20:
+    name: ARM64 / Debian 10 runtime check
+    needs: build
+    runs-on: ubuntu-22.04-arm
+    container: debian:10-slim
+    timeout-minutes: 60
+    env:
+      PACKAGE_PLATFORM: arm64-uos20
+
+    steps:
+      - name: Install Debian 10 runtime dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -eu
+          printf '%s\n' \
+            'deb http://archive.debian.org/debian buster main' \
+            'deb http://archive.debian.org/debian-security buster/updates main' \
+            > /etc/apt/sources.list
+          printf 'Acquire::Check-Valid-Until "false";\n' \
+            > /etc/apt/apt.conf.d/99archive
+          apt-get -o Acquire::Check-Valid-Until=false update
+          apt-get install -y --no-install-recommends \
+            ca-certificates libaio1 libncurses6 libtinfo6 libtirpc3 procps
+
+      - name: Resolve package name
+        env:
+          INPUT_VERSION: ${{ inputs.mysql_version }}
+        run: |
+          set -eu
+          version="$MYSQL_VERSION"
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            version="$INPUT_VERSION"
+          fi
+          {
+            echo "MYSQL_VERSION=$version"
+            echo "PACKAGE_NAME=mysql-${version}-linux-${PACKAGE_PLATFORM}"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: dist
+
+      - name: Install the artifact on the UOS 20 ABI baseline
+        run: |
+          set -eu
+          head -n 2 /etc/os-release
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc $MAX_GLIBC"
+          sha256sum --check "dist/${PACKAGE_NAME}.tar.gz.sha256"
+          tar -C / --strip-components=1 -xzf "dist/${PACKAGE_NAME}.tar.gz" \
+            "${PACKAGE_NAME}/usr"
+          test -x "$PREFIX/bin/mysqld"
+          ldd "$PREFIX/bin/mysqld"
+
+          # Plugins carry dependencies of their own (group_replication pulls in
+          # libtirpc), so every shipped ELF file is checked, not just mysqld.
+          missing=0
+          for f in "$PREFIX"/bin/* "$PREFIX"/lib/*.so* "$PREFIX"/lib/plugin/*.so; do
+            [ -f "$f" ] || continue
+            if ldd "$f" 2>/dev/null | grep -q 'not found'; then
+              echo "Unresolved dependencies in $f" >&2
+              ldd "$f" | grep 'not found' >&2
+              missing=1
+            fi
+          done
+          test "$missing" -eq 0
+
+      - name: Start mysqld and run a smoke test
+        run: |
+          set -eu
+          data="$RUNNER_TEMP/data"
+          socket="$RUNNER_TEMP/mysqld.sock"
+          errlog="$RUNNER_TEMP/mysqld.err"
+          port=13306
+          rm -rf "$data"
+          mkdir -p "$data"
+
+          "$PREFIX/bin/mysqld" --version
+          "$PREFIX/bin/mysqld" --user=root --basedir="$PREFIX" --datadir="$data" \
+            --initialize-insecure
+          "$PREFIX/bin/mysqld" --user=root --basedir="$PREFIX" --datadir="$data" \
+            --socket="$socket" --pid-file="$RUNNER_TEMP/mysqld.pid" \
+            --log-error="$errlog" --port="$port" --loose-mysqlx=OFF --daemonize
+
+          ready=0
+          for _ in $(seq 1 60); do
+            if "$PREFIX/bin/mysqladmin" --socket="$socket" --user=root ping \
+                >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat "$errlog"
+            exit 1
+          fi
+
+          "$PREFIX/bin/mysql" --socket="$socket" --user=root --execute="
+            SELECT VERSION(), @@version_compile_machine, @@version_compile_os;
+            CREATE DATABASE smoke;
+            CREATE TABLE smoke.t (id INT PRIMARY KEY, payload JSON);
+            INSERT INTO smoke.t VALUES (1, '{\"ok\": true}');
+            SELECT * FROM smoke.t;"
+          # Proves the bundled OpenSSL is usable at runtime, not just linkable.
+          "$PREFIX/bin/mysql" --protocol=tcp --host=127.0.0.1 --port="$port" \
+            --user=root --ssl-mode=REQUIRED \
+            --execute="SHOW STATUS LIKE 'Ssl_cipher';"
+          "$PREFIX/bin/mysqladmin" --socket="$socket" --user=root shutdown
+
