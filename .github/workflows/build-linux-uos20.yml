@@ -73,7 +73,11 @@ jobs:
       - name: Confirm UOS 20-compatible build baseline
         run: |
           set -eu
+          # The toolset enable script expands MANPATH unguarded, so -u must be
+          # off while it runs.
+          set +u
           source "/opt/rh/${GCC_TOOLSET}/enable"
+          set -u
           test "$(uname -m)" = 'aarch64'
           test "$(getconf GNU_LIBC_VERSION)" = "glibc $MAX_GLIBC"
           test "$(gcc -dumpversion)" = "${GCC_TOOLSET##*-}"
@@ -116,7 +120,11 @@ jobs:
       - name: Build pinned OpenSSL
         run: |
           set -eu
+          # The toolset enable script expands MANPATH unguarded, so -u must be
+          # off while it runs.
+          set +u
           source "/opt/rh/${GCC_TOOLSET}/enable"
+          set -u
           src="$RUNNER_TEMP/openssl-${OPENSSL_VERSION}"
           rm -rf "$src" "$OPENSSL_PREFIX"
 
@@ -142,7 +150,11 @@ jobs:
       - name: Configure and build MySQL
         run: |
           set -eu
+          # The toolset enable script expands MANPATH unguarded, so -u must be
+          # off while it runs.
+          set +u
           source "/opt/rh/${GCC_TOOLSET}/enable"
+          set -u
           src="$RUNNER_TEMP/mysql-${MYSQL_VERSION}"
           rm -rf "$src" "$RUNNER_TEMP/build"
 
@@ -263,7 +275,7 @@ jobs:
           boost=${BOOST_PACKAGE}
           machine=$(uname -m)
           glibc=$(getconf GNU_LIBC_VERSION)
-          gcc=$(source "/opt/rh/${GCC_TOOLSET}/enable" && gcc -dumpfullversion)
+          gcc=$(/opt/rh/${GCC_TOOLSET}/root/usr/bin/gcc -dumpfullversion)
           cmake=$(cmake --version | head -n 1)
           kernel=$(uname -sr)
           build_container=almalinux:8
