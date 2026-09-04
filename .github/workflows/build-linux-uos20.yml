@@ -135,7 +135,10 @@ jobs:
           tar -xzf "$RUNNER_TEMP/openssl.tar.gz" -C "$RUNNER_TEMP"
 
           cd "$src"
-          ./Configure \
+          # OpenSSL 1.1.1's Configure requires an explicit os/compiler target,
+          # unlike 3.x which detects one. ./config does the detection and
+          # forwards the options, so this stays correct across both generations.
+          ./config \
             --prefix="$OPENSSL_PREFIX" \
             --openssldir=/etc/ssl \
             --libdir=lib \

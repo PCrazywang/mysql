@@ -98,8 +98,11 @@ jobs:
           cmake --version | Select-Object -First 1
           & $perl -v | Select-String 'This is perl'
 
-      # MySQL needs bison; winflexbison ships it as win_bison.exe, so it is also
-      # exposed under the name MySQL's CMake looks for.
+      # MySQL's CMake wants a program named bison; winflexbison ships it as
+      # win_bison.exe. The renamed copy has to stay in the package directory:
+      # bison resolves its data\ skeleton directory relative to the executable,
+      # and the chocolatey\bin entry is only a shim that resolves its target
+      # relative to itself, so neither one survives being copied elsewhere.
       - name: Install bison
         shell: pwsh
         run: |
@@ -107,18 +110,28 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw 'Failed to install winflexbison3.'
           }
-          $winBison = Get-Command win_bison.exe -ErrorAction SilentlyContinue
-          if (-not $winBison) {
-            throw 'win_bison.exe was not found after installing winflexbison3.'
+          $tool = Get-ChildItem -Path 'C:\ProgramData\chocolatey\lib' -Recurse `
+            -Filter 'win_bison.exe' -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $tool) {
+            throw 'win_bison.exe was not found under the Chocolatey library.'
           }
-          $bisonDirectory = Join-Path $env:RUNNER_TEMP 'bison'
-          New-Item -ItemType Directory -Force -Path $bisonDirectory | Out-Null
-          $bison = Join-Path $bisonDirectory 'bison.exe'
-          Copy-Item -LiteralPath $winBison.Source -Destination $bison -Force
-          Add-Content -Path $env:GITHUB_PATH -Value $bisonDirectory
+          if (-not (Test-Path -LiteralPath (Join-Path $tool.DirectoryName 'data'))) {
+            throw "The bison data directory is missing next to $($tool.FullName)."
+          }
+          $bison = Join-Path $tool.DirectoryName 'bison.exe'
+          Copy-Item -LiteralPath $tool.FullName -Destination $bison -Force
+
+          # CMake's FindBISON only accepts output starting with "bison (GNU Bison)".
+          $versionOutput = (& $bison --version 2>&1 | Out-String)
+          Write-Output $versionOutput.Trim()
+          if ($LASTEXITCODE -ne 0 -or
+              $versionOutput -notmatch '(?m)^bison \(GNU Bison\) \d+\.\d+') {
+            throw "bison --version did not report a usable version: $versionOutput"
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $tool.DirectoryName
           Add-Content -Path $env:GITHUB_ENV -Value `
             "BISON_EXECUTABLE=$($bison -replace '\\', '/')"
-          & $bison --version | Select-Object -First 1
 
       # Pinned OpenSSL, same version as the Linux artifacts. MySQL copies the DLLs
       # next to the binaries, so the package does not need a system OpenSSL.
