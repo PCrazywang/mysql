@@ -106,9 +106,34 @@ jobs:
         id: resolve
         run: |
           set -eu
-          src="${GITHUB_WORKSPACE}/${MYSQL_SOURCE_DIR}"
-          test -f "$src/CMakeLists.txt"
-          test -f "$src/MYSQL_VERSION"
+          echo "GITHUB_WORKSPACE=${GITHUB_WORKSPACE}"
+          echo "pwd=$(pwd)"
+          echo "MYSQL_SOURCE_DIR=${MYSQL_SOURCE_DIR}"
+          ls -la "${GITHUB_WORKSPACE}" || true
+
+          # Preferred layout is <repo>/source/. Also accept the source sitting at
+          # the repo root, or this tree living one level down inside a monorepo
+          # that still runs this workflow (mysql/tag_v8.0.25/source).
+          src=""
+          for candidate in \
+              "${GITHUB_WORKSPACE}/${MYSQL_SOURCE_DIR}" \
+              "${GITHUB_WORKSPACE}" \
+              "${GITHUB_WORKSPACE}/mysql/tag_v8.0.25/${MYSQL_SOURCE_DIR}" \
+              "${GITHUB_WORKSPACE}/tag_v8.0.25/${MYSQL_SOURCE_DIR}"; do
+            if [ -f "${candidate}/CMakeLists.txt" ] && [ -f "${candidate}/MYSQL_VERSION" ]; then
+              src="$candidate"
+              break
+            fi
+          done
+          if [ -z "$src" ]; then
+            echo "Could not find a MySQL source tree (need CMakeLists.txt + MYSQL_VERSION)." >&2
+            echo "Looked under ${GITHUB_WORKSPACE}." >&2
+            find "${GITHUB_WORKSPACE}" -maxdepth 4 \( -name CMakeLists.txt -o -name MYSQL_VERSION \) \
+              -print >&2 || true
+            echo "If source/ is missing from this checkout, it was not pushed to the GitHub repository this workflow is running in." >&2
+            exit 1
+          fi
+          echo "Using MySQL source at ${src}"
 
           read_version_part() {
             sed -n "s/^${1}=\([0-9][0-9]*\)[[:space:]]*$/\1/p" \

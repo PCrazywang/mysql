@@ -78,12 +78,34 @@ jobs:
         id: resolve
         shell: pwsh
         run: |
-          $source = Join-Path $env:GITHUB_WORKSPACE $env:MYSQL_SOURCE_DIR
-          foreach ($required in 'CMakeLists.txt', 'MYSQL_VERSION') {
-            if (-not (Test-Path -LiteralPath (Join-Path $source $required))) {
-              throw "The vendored MySQL source is missing $required. Expected a source tree at $source."
-            }
+          Write-Output "GITHUB_WORKSPACE=$env:GITHUB_WORKSPACE"
+          Write-Output "MYSQL_SOURCE_DIR=$env:MYSQL_SOURCE_DIR"
+          Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE |
+            Format-Table Mode, Name | Out-String | Write-Output
+
+          # Preferred layout is <repo>\source\. Also accept the source sitting at
+          # the repo root, or this tree living one level down inside a monorepo
+          # that still runs this workflow (mysql\tag_v8.0.25\source).
+          $candidates = @(
+            (Join-Path $env:GITHUB_WORKSPACE $env:MYSQL_SOURCE_DIR),
+            $env:GITHUB_WORKSPACE,
+            (Join-Path $env:GITHUB_WORKSPACE "mysql\tag_v8.0.25\$env:MYSQL_SOURCE_DIR"),
+            (Join-Path $env:GITHUB_WORKSPACE "tag_v8.0.25\$env:MYSQL_SOURCE_DIR")
+          )
+          $source = $candidates | Where-Object {
+            (Test-Path -LiteralPath (Join-Path $_ 'CMakeLists.txt')) -and
+            (Test-Path -LiteralPath (Join-Path $_ 'MYSQL_VERSION'))
+          } | Select-Object -First 1
+
+          if (-not $source) {
+            Write-Output 'Looked for a MySQL source tree (CMakeLists.txt + MYSQL_VERSION) in:'
+            $candidates | ForEach-Object { Write-Output "  $_" }
+            throw ('No MySQL source tree was found under ' +
+              "$env:GITHUB_WORKSPACE. If $env:MYSQL_SOURCE_DIR/ is missing from " +
+              'this checkout, it was not pushed to the GitHub repository this ' +
+              'workflow is running in.')
           }
+          Write-Output "Using MySQL source at $source"
 
           $versionFile = Get-Content -LiteralPath (Join-Path $source 'MYSQL_VERSION') -Raw
           $parts = foreach ($key in 'MAJOR', 'MINOR', 'PATCH') {
@@ -96,6 +118,9 @@ jobs:
           $version = $parts -join '.'
 
           Add-Content -Path $env:GITHUB_ENV -Value "MYSQL_VERSION=$version"
+          # The staging step reads this instead of recomputing the path, so the
+          # layout is resolved exactly once.
+          Add-Content -Path $env:GITHUB_ENV -Value "MYSQL_SOURCE_TREE=$source"
           Add-Content -Path $env:GITHUB_ENV -Value `
             "PACKAGE_NAME=mysql-$version-$env:PACKAGE_PLATFORM"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$version"
@@ -226,7 +251,7 @@ jobs:
       - name: Stage the vendored MySQL source at a short path
         shell: pwsh
         run: |
-          $source = Join-Path $env:GITHUB_WORKSPACE $env:MYSQL_SOURCE_DIR
+          $source = $env:MYSQL_SOURCE_TREE
           Remove-Item -LiteralPath $env:SOURCE_ROOT -Recurse -Force `
             -ErrorAction SilentlyContinue
 
