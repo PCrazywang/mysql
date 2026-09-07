@@ -15,27 +15,43 @@ on:
       - master
       - main
   workflow_dispatch:
-    inputs:
-      mysql_version:
-        description: 'MySQL version to build, for example 8.0.25'
-        required: false
-        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  MYSQL_VERSION: 8.0.25
-  MYSQL_SHA256: ''
+  # MySQL is built from the source tree vendored in this repository under
+  # source/, not downloaded. The version is read from source/MYSQL_VERSION so
+  # the built version can never disagree with the source that produced it.
+  MYSQL_SOURCE_DIR: source
   # MySQL 8.0.25 requires OpenSSL 1.x; 1.1.x release tags keep the old naming.
   OPENSSL_VERSION: 1.1.1w
   OPENSSL_TAG: OpenSSL_1_1_1w
+  # cmake/boost.cmake pins Boost exactly: a minor version other than 73 calls
+  # COULD_NOT_FIND_BOOST() and fails the configure step. The plain MySQL source
+  # tarball (which is what source/ holds) carries no boost/, so the headers are
+  # fetched here. boost.cmake's own DOWNLOAD_BOOST points at dl.bintray.com,
+  # which no longer exists, so the download is done here against the official
+  # archive with a pinned checksum instead.
+  BOOST_VERSION: 1.73.0
+  BOOST_PACKAGE_NAME: boost_1_73_0
+  BOOST_SHA256: 9995e192e68528793755692917f9eb6422f3052a53c5e13ba278a228af6c7acf
   PACKAGE_PLATFORM: windows-x64
+  # The build and the install step must both name this configuration, so it
+  # lives here rather than being spelled out twice. It cannot be Release: see
+  # the "Configure and build MySQL from the vendored source" step. Note that
+  # `cmake --install` falls
+  # back to Release when --config is omitted, which is exactly the mismatch
+  # the install step asserts against below.
+  MSVC_CONFIG: RelWithDebInfo
   # Short roots keep the MySQL source and build trees clear of MAX_PATH limits.
+  # The workspace path is already deep before MySQL's own nesting is added, so
+  # the vendored source is copied to SOURCE_ROOT rather than built in place.
   SOURCE_ROOT: C:\mysql-src
   BUILD_ROOT: C:\mysql-build
   OPENSSL_ROOT: C:\openssl-x64
+  BOOST_ROOT_DIR: C:\boost
   INSTALL_PREFIX: C:\mysql
 
 jobs:
@@ -43,6 +59,9 @@ jobs:
     name: Windows x64 / MSVC
     runs-on: windows-2022
     timeout-minutes: 360
+    outputs:
+      mysql_version: ${{ steps.resolve.outputs.version }}
+      package_name: ${{ steps.resolve.outputs.package_name }}
 
     steps:
       - uses: actions/checkout@v6
@@ -52,29 +71,42 @@ jobs:
         with:
           arch: x64
 
-      - name: Resolve build inputs
+      # The version is derived from the vendored source itself rather than being
+      # declared anywhere, so there is no second place that could drift out of
+      # step with what is actually compiled.
+      - name: Resolve build inputs from the vendored source
         id: resolve
         shell: pwsh
-        env:
-          INPUT_VERSION: ${{ inputs.mysql_version }}
         run: |
-          $version = $env:MYSQL_VERSION
-          if ($env:INPUT_VERSION) {
-            $version = $env:INPUT_VERSION
+          $source = Join-Path $env:GITHUB_WORKSPACE $env:MYSQL_SOURCE_DIR
+          foreach ($required in 'CMakeLists.txt', 'MYSQL_VERSION') {
+            if (-not (Test-Path -LiteralPath (Join-Path $source $required))) {
+              throw "The vendored MySQL source is missing $required. Expected a source tree at $source."
+            }
           }
-          if ($version -notmatch '^\d+\.\d+\.\d+$') {
-            throw "Unexpected MySQL version: $version"
+
+          $versionFile = Get-Content -LiteralPath (Join-Path $source 'MYSQL_VERSION') -Raw
+          $parts = foreach ($key in 'MAJOR', 'MINOR', 'PATCH') {
+            $match = [regex]::Match($versionFile, "(?m)^MYSQL_VERSION_$key=(\d+)\s*$")
+            if (-not $match.Success) {
+              throw "Could not read MYSQL_VERSION_$key from the vendored source."
+            }
+            $match.Groups[1].Value
           }
-          $series = ($version -split '\.')[0..1] -join '.'
+          $version = $parts -join '.'
+
           Add-Content -Path $env:GITHUB_ENV -Value "MYSQL_VERSION=$version"
-          Add-Content -Path $env:GITHUB_ENV -Value "MYSQL_SERIES=$series"
-          # 8.0.x does not ship Boost in the plain source tarball (that starts
-          # with 8.3), so the mysql-boost distribution is the one to fetch.
-          Add-Content -Path $env:GITHUB_ENV -Value `
-            "MYSQL_TARBALL=mysql-boost-$version.tar.gz"
           Add-Content -Path $env:GITHUB_ENV -Value `
             "PACKAGE_NAME=mysql-$version-$env:PACKAGE_PLATFORM"
           Add-Content -Path $env:GITHUB_OUTPUT -Value "version=$version"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value `
+            "package_name=mysql-$version-$env:PACKAGE_PLATFORM"
+
+          Write-Output "Building MySQL $version from $env:MYSQL_SOURCE_DIR/ in this repository."
+          $info = Join-Path $source 'Docs\INFO_SRC'
+          if (Test-Path -LiteralPath $info) {
+            Get-Content -LiteralPath $info
+          }
 
       - name: Verify Windows toolchain
         shell: pwsh
@@ -187,70 +219,77 @@ jobs:
           }
           & "$env:OPENSSL_ROOT\bin\openssl.exe" version
 
-      - name: Download MySQL source
+      # MySQL's own source paths are long enough that building under the deep
+      # workspace path risks MAX_PATH failures in the middle of a multi-hour
+      # build, so the tree is staged at a short root first. robocopy is used
+      # because it handles this many files far faster than Copy-Item.
+      - name: Stage the vendored MySQL source at a short path
         shell: pwsh
         run: |
-          $version = $env:MYSQL_VERSION
-          $archive = Join-Path $env:RUNNER_TEMP $env:MYSQL_TARBALL
-          # Current releases live under Downloads/, older ones move to archives/.
-          $bases = @(
-            "https://cdn.mysql.com/Downloads/MySQL-$env:MYSQL_SERIES",
-            "https://cdn.mysql.com/archives/mysql-$env:MYSQL_SERIES"
-          )
-          $downloaded = $false
-          foreach ($base in $bases) {
-            curl.exe -L --fail --retry 5 --retry-delay 5 --retry-connrefused `
-              "$base/$env:MYSQL_TARBALL" -o $archive
-            if ($LASTEXITCODE -eq 0) {
-              Write-Output "Downloaded $base/$env:MYSQL_TARBALL"
-              $downloaded = $true
-              break
-            }
-          }
-          if (-not $downloaded) {
-            throw 'Failed to download the MySQL source.'
-          }
-          if ($env:MYSQL_SHA256) {
-            $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($hash -ne $env:MYSQL_SHA256.ToLowerInvariant()) {
-              throw "MySQL source checksum mismatch: $hash"
-            }
-          }
-
+          $source = Join-Path $env:GITHUB_WORKSPACE $env:MYSQL_SOURCE_DIR
           Remove-Item -LiteralPath $env:SOURCE_ROOT -Recurse -Force `
             -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $env:SOURCE_ROOT | Out-Null
-          tar.exe -xzf $archive -C $env:SOURCE_ROOT
-          if ($LASTEXITCODE -ne 0) {
-            throw 'Failed to extract the MySQL source.'
-          }
-          $source = Join-Path $env:SOURCE_ROOT "mysql-$version"
-          if (-not (Test-Path -LiteralPath (Join-Path $source 'CMakeLists.txt'))) {
-            throw 'The MySQL source tree was not extracted as expected.'
-          }
-          Add-Content -Path $env:GITHUB_ENV -Value `
-            "MYSQL_SOURCE=$($source -replace '\\', '/')"
 
-          # WITH_BOOST is mandatory for 8.0.x. Point it at the boost directory of
-          # the mysql-boost tarball and let MySQL's own boost.cmake resolve what is
-          # inside it: it accepts a boost_1_xx_0 subdirectory, a boost tarball, or
-          # boost/version.hpp sitting directly in that directory.
-          $boostDirectory = Join-Path $source 'boost'
-          if (-not (Test-Path -LiteralPath $boostDirectory)) {
-            Get-ChildItem -LiteralPath $source | Select-Object -First 30 -Property Name
-            throw "No boost directory in $source; is this the mysql-boost tarball?"
+          robocopy.exe $source $env:SOURCE_ROOT /E /NFL /NDL /NJH /NJS /NP /MT:8 |
+            Out-Null
+          # robocopy uses a bit field: < 8 means files were copied and/or were
+          # already current, >= 8 means at least one copy actually failed.
+          if ($LASTEXITCODE -ge 8) {
+            throw "robocopy failed to stage the MySQL source (exit $LASTEXITCODE)."
           }
-          Write-Output "Contents of ${boostDirectory}:"
-          Get-ChildItem -LiteralPath $boostDirectory | Select-Object -Property Name, Length
-          $boostPackage = (Get-ChildItem -LiteralPath $boostDirectory -Directory `
-            -Filter 'boost_1_*' -ErrorAction SilentlyContinue |
-            Select-Object -First 1).Name
-          if (-not $boostPackage) {
-            $boostPackage = 'bundled'
+          $global:LASTEXITCODE = 0
+
+          if (-not (Test-Path -LiteralPath (Join-Path $env:SOURCE_ROOT 'CMakeLists.txt'))) {
+            throw "The MySQL source was not staged as expected at $env:SOURCE_ROOT."
           }
-          Add-Content -Path $env:GITHUB_ENV -Value "BOOST_PACKAGE=$boostPackage"
           Add-Content -Path $env:GITHUB_ENV -Value `
-            "BOOST_ROOT_DIR=$($boostDirectory -replace '\\', '/')"
+            "MYSQL_SOURCE=$($env:SOURCE_ROOT -replace '\\', '/')"
+
+          $staged = @(Get-ChildItem -LiteralPath $env:SOURCE_ROOT -Recurse -File).Count
+          Write-Output "Staged $staged files into $env:SOURCE_ROOT."
+
+      # Boost is the one build input the vendored source cannot supply: the plain
+      # MySQL source tarball ships no boost/, and 8.0.25 needs the 1.73.0 headers.
+      # It is extracted here rather than handed to cmake as an archive, so that
+      # boost.cmake takes its "unzipped version" path.
+      - name: Fetch pinned Boost headers
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "$env:BOOST_PACKAGE_NAME.tar.gz"
+          Remove-Item -LiteralPath $env:BOOST_ROOT_DIR -Recurse -Force `
+            -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $env:BOOST_ROOT_DIR | Out-Null
+
+          curl.exe -L --fail --retry 5 --retry-delay 5 --retry-connrefused `
+            "https://archives.boost.io/release/$env:BOOST_VERSION/source/$env:BOOST_PACKAGE_NAME.tar.gz" `
+            -o $archive
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Failed to download the Boost source.'
+          }
+
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:BOOST_SHA256.ToLowerInvariant()) {
+            throw "Boost checksum mismatch: expected $env:BOOST_SHA256, got $hash"
+          }
+
+          tar.exe -xzf $archive -C $env:BOOST_ROOT_DIR
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Failed to extract the Boost source.'
+          }
+          Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+
+          # boost.cmake reads the version out of this header and insists on 1.73.
+          $boostDirectory = Join-Path $env:BOOST_ROOT_DIR $env:BOOST_PACKAGE_NAME
+          $versionHeader = Join-Path $boostDirectory 'boost\version.hpp'
+          if (-not (Test-Path -LiteralPath $versionHeader)) {
+            throw "Boost headers are missing: $versionHeader"
+          }
+          if (-not (Select-String -LiteralPath $versionHeader `
+              -Pattern '^#define BOOST_VERSION 107300' -Quiet)) {
+            throw "$versionHeader does not report Boost 1.73.0."
+          }
+          Add-Content -Path $env:GITHUB_ENV -Value `
+            "BOOST_INCLUDE_ROOT=$($boostDirectory -replace '\\', '/')"
 
       # RelWithDebInfo, not Release: install_macros.cmake installs
       # $<TARGET_PDB_FILE:...> next to every .exe/.dll with no OPTIONAL, and a
@@ -261,15 +300,18 @@ jobs:
       # Windows packages are RelWithDebInfo, where cmake already puts /debug
       # on the linker flags; that is why the typo went unnoticed. Keep the
       # two --config values in lockstep: a Release install of a RelWithDebInfo
-      # build (or the reverse) looks in the wrong output directory.
-      - name: Configure and build MySQL
+      # build (or the reverse) looks in the wrong output directory. Both read
+      # env.MSVC_CONFIG so they cannot drift apart.
+      - name: Configure and build MySQL from the vendored source
         shell: pwsh
         run: |
+          # An out-of-source build keeps the staged tree reusable; MySQL's
+          # CMakeLists refuses an in-source build outright.
           cmake -S "$env:MYSQL_SOURCE" -B "$env:BUILD_ROOT" `
             -G 'Visual Studio 17 2022' -A x64 `
             "-DCMAKE_INSTALL_PREFIX=$($env:INSTALL_PREFIX -replace '\\', '/')" `
             "-DWITH_SSL=$($env:OPENSSL_ROOT -replace '\\', '/')" `
-            "-DWITH_BOOST=$env:BOOST_ROOT_DIR" `
+            "-DWITH_BOOST=$env:BOOST_INCLUDE_ROOT" `
             "-DBISON_EXECUTABLE=$env:BISON_EXECUTABLE" `
             -DWITH_ZLIB=bundled `
             -DWITH_ZSTD=bundled `
@@ -281,10 +323,25 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw 'CMake configuration failed.'
           }
-          cmake --build "$env:BUILD_ROOT" --config RelWithDebInfo --parallel
+          cmake --build "$env:BUILD_ROOT" --config $env:MSVC_CONFIG --parallel
           if ($LASTEXITCODE -ne 0) {
             throw 'The MySQL build failed.'
           }
+
+          # The install rules require a PDB next to every .dll and .exe, so a
+          # configuration that does not emit them fails halfway through the
+          # install with a confusing "file INSTALL cannot find" message. Check
+          # the one that install reaches first, while the build log is still
+          # the thing being looked at.
+          $pdb = Join-Path $env:BUILD_ROOT `
+            "library_output_directory\$env:MSVC_CONFIG\libmysql.pdb"
+          if (-not (Test-Path -LiteralPath $pdb)) {
+            throw ("The $env:MSVC_CONFIG build produced no $pdb. MySQL's " +
+              'install rules are not OPTIONAL for PDB files, so the install ' +
+              'step would fail. Keep MSVC_CONFIG at RelWithDebInfo, or pass ' +
+              'the /DEBUG linker flags described in the README.')
+          }
+
           $drive = Get-PSDrive -Name C
           Write-Output ("C: free {0:N1} GB of {1:N1} GB after the MySQL build." -f `
             ($drive.Free / 1GB), (($drive.Used + $drive.Free) / 1GB))
@@ -294,10 +351,46 @@ jobs:
         run: |
           $stage = Join-Path $env:RUNNER_TEMP $env:PACKAGE_NAME
           Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
-          cmake --install "$env:BUILD_ROOT" --config RelWithDebInfo --prefix $stage
+          # --config is not optional here. Without it cmake_install.cmake falls
+          # back to Release, and a Release install of a RelWithDebInfo build
+          # looks for PDB files in library_output_directory/Release, which does
+          # not exist. The two checks after the install catch that regression.
+          # stderr is deliberately left alone: merging it into the pipeline
+          # turns cmake's diagnostics into ErrorRecords, and this shell runs
+          # with $ErrorActionPreference = 'stop'.
+          $log = Join-Path $env:RUNNER_TEMP 'mysql-install.log'
+          cmake --install "$env:BUILD_ROOT" --config $env:MSVC_CONFIG `
+            --prefix $stage | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) {
             throw 'The MySQL installation step failed.'
           }
+
+          # cmake_install.cmake only announces the configuration when it had to
+          # choose one itself, which is to say when --config did not reach it.
+          # So this line being present at all means the argument was dropped,
+          # and the value it fell back to is the Release default. A successful
+          # install with --config honored prints nothing here.
+          $fallback = Select-String -LiteralPath $log `
+            -Pattern 'Install configuration: "(.+)"' | Select-Object -First 1
+          if ($fallback) {
+            $reported = $fallback.Matches[0].Groups[1].Value
+            if ($reported -ne $env:MSVC_CONFIG) {
+              throw ("The install fell back to configuration '$reported' " +
+                "instead of using '$env:MSVC_CONFIG'; the staged tree does " +
+                'not match the build. Check that --config is still passed.')
+            }
+          }
+
+          # The install rules copy a PDB next to every binary. Their presence
+          # here proves the install read the $env:MSVC_CONFIG output tree, and
+          # the packaging step below expects to find them to delete.
+          $staged = @(Get-ChildItem -LiteralPath $stage -Recurse -Filter '*.pdb' `
+            -File -ErrorAction SilentlyContinue)
+          if ($staged.Count -eq 0) {
+            throw "No PDB files were staged; the install did not read the $env:MSVC_CONFIG tree."
+          }
+          Write-Output ("Installed the $env:MSVC_CONFIG build into $stage " +
+            "($($staged.Count) PDB files staged).")
           Add-Content -Path $env:GITHUB_ENV -Value "STAGE_DIRECTORY=$stage"
 
           foreach ($file in @('bin\mysqld.exe', 'bin\mysql.exe', 'bin\mysqladmin.exe')) {
@@ -400,11 +493,12 @@ jobs:
           $buildInfo = @"
           package_platform=$env:PACKAGE_PLATFORM
           mysql_version=$env:MYSQL_VERSION
+          mysql_source=in-repo $env:MYSQL_SOURCE_DIR/ @ $env:GITHUB_SHA
           openssl_version=$env:OPENSSL_VERSION
-          boost=$env:BOOST_PACKAGE
+          boost=$env:BOOST_PACKAGE_NAME (pinned, archives.boost.io)
           architecture=x64
           compiler=MSVC
-          build_type=RelWithDebInfo (PDB files removed from this package)
+          build_type=$env:MSVC_CONFIG (PDB files removed from this package)
           cmake=$(cmake --version | Select-Object -First 1)
           runner_image=windows-2022
           install_prefix=$env:INSTALL_PREFIX
@@ -455,35 +549,36 @@ jobs:
       contents: write
 
     steps:
+      # The version now comes from source/MYSQL_VERSION, so this compares the
+      # pushed tag against the version that was actually compiled.
       - name: Guard against mismatched version tags
         id: guard
         env:
-          INPUT_VERSION: ${{ inputs.mysql_version }}
+          MYSQL_VERSION: ${{ needs.windows-x64.outputs.mysql_version }}
         run: |
           set -eu
-          version="$MYSQL_VERSION"
-          if [ -n "${INPUT_VERSION:-}" ]; then
-            version="$INPUT_VERSION"
-          fi
           tag="${GITHUB_REF#refs/tags/}"
           case "$tag" in
-            "v${version}") ;;
-            *) echo "Tag '${tag}' does not match MySQL version '${version}'; refusing to publish." >&2; exit 1 ;;
+            "v${MYSQL_VERSION}") ;;
+            *) echo "Tag '${tag}' does not match the vendored MySQL source version '${MYSQL_VERSION}'; refusing to publish." >&2; exit 1 ;;
           esac
-          {
-            echo "package_name=mysql-${version}-${PACKAGE_PLATFORM}"
-            echo "release_tag=${tag}"
-          } >> "$GITHUB_OUTPUT"
+          echo "release_tag=${tag}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/download-artifact@v7
         with:
-          name: ${{ steps.guard.outputs.package_name }}
+          name: ${{ needs.windows-x64.outputs.package_name }}
           path: dist
 
       - name: Create or update the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          # gh resolves the target repository from the git remotes of the working
+          # directory, and this job deliberately has no actions/checkout. GH_REPO
+          # names it outright, so gh cannot fail with "unable to determine base
+          # repository" here.
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ steps.guard.outputs.release_tag }}
+          MYSQL_VERSION: ${{ needs.windows-x64.outputs.mysql_version }}
         run: |
           set -eu
           ls -lh dist
@@ -494,7 +589,7 @@ jobs:
           else
             gh release create "$RELEASE_TAG" dist/* \
               --title "MySQL ${MYSQL_VERSION}" \
-              --notes "Automated release of MySQL ${MYSQL_VERSION}.
+              --notes "Automated release of MySQL ${MYSQL_VERSION}, compiled from the source tree vendored in this repository.
 
             - Platform: ${PACKAGE_PLATFORM} (MSVC / VS 2022)
             - See BUILD-ENVIRONMENT.txt inside the package."

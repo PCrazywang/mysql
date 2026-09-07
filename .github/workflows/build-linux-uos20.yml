@@ -15,24 +15,30 @@ on:
       - master
       - main
   workflow_dispatch:
-    inputs:
-      mysql_version:
-        description: 'MySQL version to build, for example 8.0.25'
-        required: false
-        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  MYSQL_VERSION: 8.0.25
-  MYSQL_SHA256: ''
+  # MySQL is built from the source tree vendored in this repository under
+  # source/, not downloaded. The version is read from source/MYSQL_VERSION so
+  # the built version can never disagree with the source that produced it.
+  MYSQL_SOURCE_DIR: source
   # MySQL 8.0.25 requires OpenSSL 1.x (cmake/ssl.cmake only accepts major
   # version 1), so 3.x cannot be used here. OpenSSL 1.1.x release tags keep the
   # old OpenSSL_1_1_1x naming, hence the separate tag variable.
   OPENSSL_VERSION: 1.1.1w
   OPENSSL_TAG: OpenSSL_1_1_1w
+  # cmake/boost.cmake pins Boost exactly: a minor version other than 73 calls
+  # COULD_NOT_FIND_BOOST() and fails the configure step. The plain MySQL source
+  # tarball (which is what source/ holds) carries no boost/, so the headers are
+  # fetched here. boost.cmake's own DOWNLOAD_BOOST points at dl.bintray.com,
+  # which no longer exists, so the download is done here against the official
+  # archive with a pinned checksum instead.
+  BOOST_VERSION: 1.73.0
+  BOOST_PACKAGE_NAME: boost_1_73_0
+  BOOST_SHA256: 9995e192e68528793755692917f9eb6422f3052a53c5e13ba278a228af6c7acf
   # /opt/rh/gcc-toolset-10 is what MySQL 8.0.25's own CMakeLists looks for on el8.
   GCC_TOOLSET: gcc-toolset-10
   PREFIX: /usr/local/mysql
@@ -47,6 +53,9 @@ jobs:
     timeout-minutes: 360
     env:
       PACKAGE_PLATFORM: arm64-uos20
+    outputs:
+      mysql_version: ${{ steps.resolve.outputs.version }}
+      package_name: ${{ steps.resolve.outputs.package_name }}
 
     steps:
       # UOS 20, Debian 10 and EL8 share glibc 2.28, but UOS 20's own GCC 8.3 is
@@ -90,30 +99,43 @@ jobs:
           command -v rpcgen
           pkg-config --modversion libtirpc
 
-      - name: Resolve build inputs
+      # The version is derived from the vendored source itself rather than being
+      # declared anywhere, so there is no second place that could drift out of
+      # step with what is actually compiled.
+      - name: Resolve build inputs from the vendored source
         id: resolve
-        env:
-          INPUT_VERSION: ${{ inputs.mysql_version }}
         run: |
           set -eu
-          version="$MYSQL_VERSION"
-          if [ -n "${INPUT_VERSION:-}" ]; then
-            version="$INPUT_VERSION"
-          fi
-          case "$version" in
-            [0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "Unexpected MySQL version: $version" >&2; exit 1 ;;
-          esac
+          src="${GITHUB_WORKSPACE}/${MYSQL_SOURCE_DIR}"
+          test -f "$src/CMakeLists.txt"
+          test -f "$src/MYSQL_VERSION"
+
+          read_version_part() {
+            sed -n "s/^${1}=\([0-9][0-9]*\)[[:space:]]*$/\1/p" \
+              "$src/MYSQL_VERSION"
+          }
+          major="$(read_version_part MYSQL_VERSION_MAJOR)"
+          minor="$(read_version_part MYSQL_VERSION_MINOR)"
+          patch="$(read_version_part MYSQL_VERSION_PATCH)"
+          test -n "$major" && test -n "$minor" && test -n "$patch"
+          version="${major}.${minor}.${patch}"
+
           {
+            echo "MYSQL_SOURCE=$src"
             echo "MYSQL_VERSION=$version"
-            echo "MYSQL_SERIES=${version%.*}"
-            # 8.0.x does not ship Boost in the plain source tarball (that starts
-            # with 8.3), so the mysql-boost distribution is the one to fetch.
-            echo "MYSQL_TARBALL=mysql-boost-${version}.tar.gz"
             echo "PACKAGE_NAME=mysql-${version}-linux-${PACKAGE_PLATFORM}"
             echo "OPENSSL_PREFIX=${RUNNER_TEMP}/openssl-install"
+            echo "BOOST_DIR=${RUNNER_TEMP}/boost"
           } >> "$GITHUB_ENV"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=$version"
+            echo "package_name=mysql-${version}-linux-${PACKAGE_PLATFORM}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Building MySQL ${version} from ${MYSQL_SOURCE_DIR}/ in this repository."
+          if [ -f "$src/Docs/INFO_SRC" ]; then
+            cat "$src/Docs/INFO_SRC"
+          fi
 
       # Pinned OpenSSL: MySQL copies a custom OpenSSL into lib/private and sets an
       # $ORIGIN rpath, so the artifact does not use the target system's OpenSSL.
@@ -150,7 +172,32 @@ jobs:
           test -f "$OPENSSL_PREFIX/lib/libcrypto.so.1.1"
           LD_LIBRARY_PATH="$OPENSSL_PREFIX/lib" "$OPENSSL_PREFIX/bin/openssl" version
 
-      - name: Configure and build MySQL
+      # Boost is the one build input the vendored source cannot supply: the plain
+      # MySQL source tarball ships no boost/, and 8.0.25 needs the 1.73.0 headers.
+      # It is extracted here rather than handed to cmake as a tarball, because
+      # boost.cmake only shells out to cmake/filesize.bat (a Windows batch file,
+      # via GET_FILE_SIZE) when it finds an archive instead of a directory.
+      - name: Fetch pinned Boost headers
+        run: |
+          set -eu
+          rm -rf "$BOOST_DIR"
+          mkdir -p "$BOOST_DIR"
+
+          archive="$RUNNER_TEMP/${BOOST_PACKAGE_NAME}.tar.gz"
+          curl --fail --location --retry 5 --retry-delay 5 \
+            --retry-connrefused \
+            "https://archives.boost.io/release/${BOOST_VERSION}/source/${BOOST_PACKAGE_NAME}.tar.gz" \
+            --output "$archive"
+          echo "${BOOST_SHA256}  ${archive}" | sha256sum --check -
+          tar -xzf "$archive" -C "$BOOST_DIR"
+          rm -f "$archive"
+
+          # boost.cmake reads the version out of this header and insists on 1.73.
+          version_header="$BOOST_DIR/$BOOST_PACKAGE_NAME/boost/version.hpp"
+          test -f "$version_header"
+          grep -E '^#define BOOST_VERSION 107300' "$version_header"
+
+      - name: Configure and build MySQL from the vendored source
         run: |
           set -eu
           # The toolset enable script expands MANPATH unguarded, so -u must be
@@ -158,54 +205,15 @@ jobs:
           set +u
           source "/opt/rh/${GCC_TOOLSET}/enable"
           set -u
-          src="$RUNNER_TEMP/mysql-${MYSQL_VERSION}"
-          rm -rf "$src" "$RUNNER_TEMP/build"
+          rm -rf "$RUNNER_TEMP/build"
 
-          # Current releases live under Downloads/, older ones move to archives/.
-          downloaded=0
-          for base in "https://cdn.mysql.com/Downloads/MySQL-${MYSQL_SERIES}" \
-                      "https://cdn.mysql.com/archives/mysql-${MYSQL_SERIES}"; do
-            if curl --fail --location --retry 5 --retry-delay 5 \
-                --retry-connrefused \
-                "${base}/${MYSQL_TARBALL}" \
-                --output "$RUNNER_TEMP/mysql.tar.gz"; then
-              echo "Downloaded ${base}/${MYSQL_TARBALL}"
-              downloaded=1
-              break
-            fi
-          done
-          test "$downloaded" -eq 1
-          if [ -n "$MYSQL_SHA256" ]; then
-            echo "${MYSQL_SHA256}  ${RUNNER_TEMP}/mysql.tar.gz" | sha256sum --check -
-          fi
-          tar -xzf "$RUNNER_TEMP/mysql.tar.gz" -C "$RUNNER_TEMP"
-          if [ ! -f "$src/CMakeLists.txt" ]; then
-            echo "Unexpected source layout: no CMakeLists.txt in $src" >&2
-            ls -la "$RUNNER_TEMP" >&2
-            exit 1
-          fi
-
-          # WITH_BOOST is mandatory for 8.0.x. Point it at the boost directory of
-          # the mysql-boost tarball and let MySQL's own boost.cmake resolve what is
-          # inside it: it accepts a boost_1_xx_0 subdirectory, a boost tarball, or
-          # boost/version.hpp sitting directly in that directory.
-          boost_dir="$src/boost"
-          if [ ! -d "$boost_dir" ]; then
-            echo "No boost directory in $src; is this the mysql-boost tarball?" >&2
-            ls -la "$src" >&2
-            exit 1
-          fi
-          echo "Contents of $boost_dir:"
-          ls -la "$boost_dir"
-          boost_package="$(find "$boost_dir" -maxdepth 1 -name 'boost_1_*' \
-            -exec basename '{}' \; | head -n 1 || true)"
-          echo "BOOST_PACKAGE=${boost_package:-bundled}" >> "$GITHUB_ENV"
-
-          cmake -S "$src" -B "$RUNNER_TEMP/build" \
+          # An out-of-source build keeps the checked-out tree pristine; MySQL's
+          # CMakeLists refuses an in-source build outright.
+          cmake -S "$MYSQL_SOURCE" -B "$RUNNER_TEMP/build" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DINSTALL_LAYOUT=STANDALONE \
-            -DWITH_BOOST="$boost_dir" \
+            -DWITH_BOOST="$BOOST_DIR/$BOOST_PACKAGE_NAME" \
             -DWITH_SSL="$OPENSSL_PREFIX" \
             -DWITH_ZLIB=bundled \
             -DWITH_ZSTD=bundled \
@@ -223,7 +231,7 @@ jobs:
       - name: Stage and verify UOS 20-compatible artifact
         run: |
           set -eu
-          src="$RUNNER_TEMP/mysql-${MYSQL_VERSION}"
+          src="$MYSQL_SOURCE"
           stage="$RUNNER_TEMP/$PACKAGE_NAME"
           prefix="$stage$PREFIX"
           rm -rf "$stage"
@@ -286,8 +294,9 @@ jobs:
           cat > "$stage/BUILD-ENVIRONMENT.txt" <<EOF
           package_platform=linux-${PACKAGE_PLATFORM}
           mysql_version=${MYSQL_VERSION}
+          mysql_source=in-repo ${MYSQL_SOURCE_DIR}/ @ ${GITHUB_SHA}
           openssl_version=${OPENSSL_VERSION}
-          boost=${BOOST_PACKAGE}
+          boost=${BOOST_PACKAGE_NAME} (pinned, archives.boost.io)
           machine=$(uname -m)
           glibc=$(getconf GNU_LIBC_VERSION)
           gcc=$(/opt/rh/${GCC_TOOLSET}/root/usr/bin/gcc -dumpfullversion)
@@ -323,8 +332,6 @@ jobs:
     runs-on: ubuntu-22.04-arm
     container: debian:10-slim
     timeout-minutes: 60
-    env:
-      PACKAGE_PLATFORM: arm64-uos20
 
     steps:
       - name: Install Debian 10 runtime dependencies
@@ -343,22 +350,16 @@ jobs:
             ca-certificates libaio1 libncurses6 libtinfo6 libtirpc3 procps
 
       - name: Resolve package name
-        env:
-          INPUT_VERSION: ${{ inputs.mysql_version }}
         run: |
           set -eu
-          version="$MYSQL_VERSION"
-          if [ -n "${INPUT_VERSION:-}" ]; then
-            version="$INPUT_VERSION"
-          fi
           {
-            echo "MYSQL_VERSION=$version"
-            echo "PACKAGE_NAME=mysql-${version}-linux-${PACKAGE_PLATFORM}"
+            echo "MYSQL_VERSION=${{ needs.build.outputs.mysql_version }}"
+            echo "PACKAGE_NAME=${{ needs.build.outputs.package_name }}"
           } >> "$GITHUB_ENV"
 
       - uses: actions/download-artifact@v7
         with:
-          name: ${{ env.PACKAGE_NAME }}
+          name: ${{ needs.build.outputs.package_name }}
           path: dist
 
       - name: Install the artifact on the UOS 20 ABI baseline
@@ -427,4 +428,67 @@ jobs:
             --user=root --ssl-mode=REQUIRED \
             --execute="SHOW STATUS LIKE 'Ssl_cipher';"
           "$PREFIX/bin/mysqladmin" --socket="$socket" --user=root shutdown
+
+  # Publish the verified artifact to a GitHub Release when a version tag (v*)
+  # is pushed. The Windows workflow publishes into the same tag; whichever job
+  # runs first creates the release, the other only uploads its own assets, so
+  # the two never fight over the tag.
+  release:
+    name: Publish GitHub Release
+    needs: [build, verify-uos20]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      PACKAGE_PLATFORM: arm64-uos20
+
+    steps:
+      # The version now comes from source/MYSQL_VERSION, so this compares the
+      # pushed tag against the version that was actually compiled.
+      - name: Guard against mismatched version tags
+        id: guard
+        env:
+          MYSQL_VERSION: ${{ needs.build.outputs.mysql_version }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF#refs/tags/}"
+          case "$tag" in
+            "v${MYSQL_VERSION}") ;;
+            *) echo "Tag '${tag}' does not match the vendored MySQL source version '${MYSQL_VERSION}'; refusing to publish." >&2; exit 1 ;;
+          esac
+          echo "release_tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.build.outputs.package_name }}
+          path: dist
+
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # gh resolves the target repository from the git remotes of the working
+          # directory, and this job deliberately has no actions/checkout. GH_REPO
+          # names it outright, so gh cannot fail with "unable to determine base
+          # repository" here.
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.guard.outputs.release_tag }}
+          MYSQL_VERSION: ${{ needs.build.outputs.mysql_version }}
+        run: |
+          set -eu
+          ls -lh dist
+          # The Windows workflow may publish into the same tag in parallel:
+          # create if missing, otherwise just attach this platform's assets.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --title "MySQL ${MYSQL_VERSION}" \
+              --notes "Automated release of MySQL ${MYSQL_VERSION}, compiled from the source tree vendored in this repository.
+
+            - Platform: linux-${PACKAGE_PLATFORM} (glibc 2.28 / UOS 20 ABI)
+            - Assets verified on Debian 10 before publishing; see BUILD-ENVIRONMENT.txt inside the package."
+          fi
+          gh release view "$RELEASE_TAG" \
+            --json tagName,assets --jq '.tagName, (.assets[].name)'
 
