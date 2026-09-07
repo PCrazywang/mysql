@@ -231,21 +231,37 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value `
             "MYSQL_SOURCE=$($source -replace '\\', '/')"
 
-          # WITH_BOOST is mandatory for 8.0.x; the mysql-boost tarball carries the
-          # exact Boost release this MySQL version expects.
-          $boost = Get-ChildItem -LiteralPath $source -Recurse -Depth 2 -Directory `
-            -Filter 'boost_1_*' | Select-Object -First 1
-          if (-not $boost) {
-            throw 'The bundled Boost directory was not found in the MySQL source.'
+          # WITH_BOOST is mandatory for 8.0.x. Point it at the boost directory of
+          # the mysql-boost tarball and let MySQL's own boost.cmake resolve what is
+          # inside it: it accepts a boost_1_xx_0 subdirectory, a boost tarball, or
+          # boost/version.hpp sitting directly in that directory.
+          $boostDirectory = Join-Path $source 'boost'
+          if (-not (Test-Path -LiteralPath $boostDirectory)) {
+            Get-ChildItem -LiteralPath $source | Select-Object -First 30 -Property Name
+            throw "No boost directory in $source; is this the mysql-boost tarball?"
           }
-          if (-not (Test-Path -LiteralPath (Join-Path $boost.FullName 'boost\version.hpp'))) {
-            throw "Boost headers are missing under $($boost.FullName)."
+          Write-Output "Contents of ${boostDirectory}:"
+          Get-ChildItem -LiteralPath $boostDirectory | Select-Object -Property Name, Length
+          $boostPackage = (Get-ChildItem -LiteralPath $boostDirectory -Directory `
+            -Filter 'boost_1_*' -ErrorAction SilentlyContinue |
+            Select-Object -First 1).Name
+          if (-not $boostPackage) {
+            $boostPackage = 'bundled'
           }
-          Write-Output "Using bundled Boost at $($boost.FullName)"
-          Add-Content -Path $env:GITHUB_ENV -Value "BOOST_PACKAGE=$($boost.Name)"
+          Add-Content -Path $env:GITHUB_ENV -Value "BOOST_PACKAGE=$boostPackage"
           Add-Content -Path $env:GITHUB_ENV -Value `
-            "BOOST_ROOT_DIR=$($boost.FullName -replace '\\', '/')"
+            "BOOST_ROOT_DIR=$($boostDirectory -replace '\\', '/')"
 
+      # RelWithDebInfo, not Release: install_macros.cmake installs
+      # $<TARGET_PDB_FILE:...> next to every .exe/.dll with no OPTIONAL, and a
+      # Release build never produces those PDBs. cmake/os/Windows.cmake intends
+      # to add /debug to CMAKE_${type}_LINKER_FLAGS_RELEASE so that it would,
+      # but the $ is missing, so the assignment lands on a variable named
+      # CMAKE_{type}_LINKER_FLAGS_RELEASE that nothing reads. Oracle's own
+      # Windows packages are RelWithDebInfo, where cmake already puts /debug
+      # on the linker flags; that is why the typo went unnoticed. Keep the
+      # two --config values in lockstep: a Release install of a RelWithDebInfo
+      # build (or the reverse) looks in the wrong output directory.
       - name: Configure and build MySQL
         shell: pwsh
         run: |
@@ -265,17 +281,20 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw 'CMake configuration failed.'
           }
-          cmake --build "$env:BUILD_ROOT" --config Release --parallel
+          cmake --build "$env:BUILD_ROOT" --config RelWithDebInfo --parallel
           if ($LASTEXITCODE -ne 0) {
             throw 'The MySQL build failed.'
           }
+          $drive = Get-PSDrive -Name C
+          Write-Output ("C: free {0:N1} GB of {1:N1} GB after the MySQL build." -f `
+            ($drive.Free / 1GB), (($drive.Used + $drive.Free) / 1GB))
 
       - name: Stage and verify Windows artifact
         shell: pwsh
         run: |
           $stage = Join-Path $env:RUNNER_TEMP $env:PACKAGE_NAME
           Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
-          cmake --install "$env:BUILD_ROOT" --config Release --prefix $stage
+          cmake --install "$env:BUILD_ROOT" --config RelWithDebInfo --prefix $stage
           if ($LASTEXITCODE -ne 0) {
             throw 'The MySQL installation step failed.'
           }
@@ -360,6 +379,24 @@ jobs:
         shell: pwsh
         run: |
           $stage = $env:STAGE_DIRECTORY
+
+          # The build has to be RelWithDebInfo (see the build step), which means
+          # the install brings a PDB along for every binary. They are only useful
+          # for crash analysis, they dwarf the binaries themselves, and Oracle
+          # ships them as a separate download rather than inside the server zip,
+          # so the runtime package drops them. The smoke test has already run
+          # against this tree at this point, so nothing here still needs them.
+          $pdbs = @(Get-ChildItem -LiteralPath $stage -Recurse -Filter '*.pdb' `
+            -File -ErrorAction SilentlyContinue)
+          if ($pdbs.Count -gt 0) {
+            $pdbBytes = ($pdbs | Measure-Object -Property Length -Sum).Sum
+            $pdbs | Remove-Item -Force
+            Write-Output ("Dropped {0} PDB files ({1:N1} MB) from the package." -f `
+              $pdbs.Count, ($pdbBytes / 1MB))
+          } else {
+            Write-Output 'No PDB files were present in the staged tree.'
+          }
+
           $buildInfo = @"
           package_platform=$env:PACKAGE_PLATFORM
           mysql_version=$env:MYSQL_VERSION
@@ -367,6 +404,7 @@ jobs:
           boost=$env:BOOST_PACKAGE
           architecture=x64
           compiler=MSVC
+          build_type=RelWithDebInfo (PDB files removed from this package)
           cmake=$(cmake --version | Select-Object -First 1)
           runner_image=windows-2022
           install_prefix=$env:INSTALL_PREFIX
@@ -404,4 +442,63 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+  # Publish the verified artifact to a GitHub Release when a version tag (v*)
+  # is pushed. The Linux workflow publishes into the same tag; whichever job
+  # runs first creates the release, the other only uploads its own assets.
+  release:
+    name: Publish GitHub Release
+    needs: [windows-x64]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Guard against mismatched version tags
+        id: guard
+        env:
+          INPUT_VERSION: ${{ inputs.mysql_version }}
+        run: |
+          set -eu
+          version="$MYSQL_VERSION"
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            version="$INPUT_VERSION"
+          fi
+          tag="${GITHUB_REF#refs/tags/}"
+          case "$tag" in
+            "v${version}") ;;
+            *) echo "Tag '${tag}' does not match MySQL version '${version}'; refusing to publish." >&2; exit 1 ;;
+          esac
+          {
+            echo "package_name=mysql-${version}-${PACKAGE_PLATFORM}"
+            echo "release_tag=${tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ steps.guard.outputs.package_name }}
+          path: dist
+
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.guard.outputs.release_tag }}
+        run: |
+          set -eu
+          ls -lh dist
+          # The Linux workflow may publish into the same tag in parallel:
+          # create if missing, otherwise just attach this platform's assets.
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --title "MySQL ${MYSQL_VERSION}" \
+              --notes "Automated release of MySQL ${MYSQL_VERSION}.
+
+            - Platform: ${PACKAGE_PLATFORM} (MSVC / VS 2022)
+            - See BUILD-ENVIRONMENT.txt inside the package."
+          fi
+          gh release view "$RELEASE_TAG" \
+            --json tagName,assets --jq '.tagName, (.assets[].name)'
 
