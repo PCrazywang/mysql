@@ -4,21 +4,14 @@ permissions:
   contents: read
 
 on:
-  push:
-    branches:
-      - master
-      - main
-    tags:
-      - 'v*'
-  pull_request:
-    branches:
-      - master
-      - main
-  workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
+    outputs:
+      mysql_version:
+        description: 'MySQL version read from the vendored source tree'
+        value: ${{ jobs.build.outputs.mysql_version }}
+      package_name:
+        description: 'Name of the uploaded Linux package artifact'
+        value: ${{ jobs.build.outputs.package_name }}
 
 env:
   # MySQL is built from the source tree vendored in this repository under
@@ -453,67 +446,4 @@ jobs:
             --user=root --ssl-mode=REQUIRED \
             --execute="SHOW STATUS LIKE 'Ssl_cipher';"
           "$PREFIX/bin/mysqladmin" --socket="$socket" --user=root shutdown
-
-  # Publish the verified artifact to a GitHub Release when a version tag (v*)
-  # is pushed. The Windows workflow publishes into the same tag; whichever job
-  # runs first creates the release, the other only uploads its own assets, so
-  # the two never fight over the tag.
-  release:
-    name: Publish GitHub Release
-    needs: [build, verify-uos20]
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      PACKAGE_PLATFORM: arm64-uos20
-
-    steps:
-      # The version now comes from source/MYSQL_VERSION, so this compares the
-      # pushed tag against the version that was actually compiled.
-      - name: Guard against mismatched version tags
-        id: guard
-        env:
-          MYSQL_VERSION: ${{ needs.build.outputs.mysql_version }}
-        run: |
-          set -eu
-          tag="${GITHUB_REF#refs/tags/}"
-          case "$tag" in
-            "v${MYSQL_VERSION}") ;;
-            *) echo "Tag '${tag}' does not match the vendored MySQL source version '${MYSQL_VERSION}'; refusing to publish." >&2; exit 1 ;;
-          esac
-          echo "release_tag=${tag}" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/download-artifact@v7
-        with:
-          name: ${{ needs.build.outputs.package_name }}
-          path: dist
-
-      - name: Create or update the GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          # gh resolves the target repository from the git remotes of the working
-          # directory, and this job deliberately has no actions/checkout. GH_REPO
-          # names it outright, so gh cannot fail with "unable to determine base
-          # repository" here.
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ steps.guard.outputs.release_tag }}
-          MYSQL_VERSION: ${{ needs.build.outputs.mysql_version }}
-        run: |
-          set -eu
-          ls -lh dist
-          # The Windows workflow may publish into the same tag in parallel:
-          # create if missing, otherwise just attach this platform's assets.
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/* --clobber
-          else
-            gh release create "$RELEASE_TAG" dist/* \
-              --title "MySQL ${MYSQL_VERSION}" \
-              --notes "Automated release of MySQL ${MYSQL_VERSION}, compiled from the source tree vendored in this repository.
-
-            - Platform: linux-${PACKAGE_PLATFORM} (glibc 2.28 / UOS 20 ABI)
-            - Assets verified on Debian 10 before publishing; see BUILD-ENVIRONMENT.txt inside the package."
-          fi
-          gh release view "$RELEASE_TAG" \
-            --json tagName,assets --jq '.tagName, (.assets[].name)'
 
