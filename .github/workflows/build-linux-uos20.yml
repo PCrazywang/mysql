@@ -4,26 +4,12 @@ permissions:
   contents: read
 
 on:
-  push:
-    branches:
-      - master
-      - main
-    tags:
-      - 'v*'
-  pull_request:
-    branches:
-      - master
-      - main
-  workflow_dispatch:
+  workflow_call:
     inputs:
       mysql_version:
         description: 'MySQL version to build, for example 8.0.25'
         required: false
         type: string
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 env:
   MYSQL_VERSION: 8.0.25

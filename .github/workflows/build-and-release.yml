@@ -1,0 +1,147 @@
+name: Build and Release MySQL
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+    inputs:
+      mysql_version:
+        description: 'MySQL version to build, for example 8.0.25'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MYSQL_VERSION: 8.0.25
+
+jobs:
+  validate-release-tag:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      mysql_version: ${{ steps.version.outputs.mysql_version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+
+    steps:
+      - name: Resolve and validate MySQL version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.mysql_version }}
+        run: |
+          set -eu
+          version="$MYSQL_VERSION"
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            version="$INPUT_VERSION"
+          fi
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "Unexpected MySQL version: $version" >&2; exit 1 ;;
+          esac
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            case "$tag" in
+              "v${version}") ;;
+              v*-[A-Za-z0-9.-]*)
+                echo "Pre-release tag '${tag}' is not supported; push stable tag v${version}." >&2
+                exit 1
+                ;;
+              *)
+                echo "Tag '${tag}' does not match MySQL version '${version}'; refusing to publish." >&2
+                exit 1
+                ;;
+            esac
+            echo "release_tag=$tag" >> "$GITHUB_OUTPUT"
+          fi
+          echo "mysql_version=$version" >> "$GITHUB_OUTPUT"
+
+  linux-arm64-uos20:
+    name: Linux ARM64 (UOS 20 compatible)
+    needs: validate-release-tag
+    uses: ./.github/workflows/build-linux-uos20.yml
+    with:
+      mysql_version: ${{ needs.validate-release-tag.outputs.mysql_version }}
+
+  windows-x64:
+    name: Windows x64
+    needs: validate-release-tag
+    uses: ./.github/workflows/build-windows-x64.yml
+    with:
+      mysql_version: ${{ needs.validate-release-tag.outputs.mysql_version }}
+
+  release:
+    name: Publish GitHub Release
+    needs: [validate-release-tag, linux-arm64-uos20, windows-x64]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Linux ARM64 artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: mysql-${{ needs.validate-release-tag.outputs.mysql_version }}-linux-arm64-uos20
+          path: dist/linux-arm64-uos20
+
+      - name: Download Windows x64 artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: mysql-${{ needs.validate-release-tag.outputs.mysql_version }}-windows-x64
+          path: dist/windows-x64
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MYSQL_RELEASE_VERSION: ${{ needs.validate-release-tag.outputs.mysql_version }}
+          RELEASE_TAG: ${{ needs.validate-release-tag.outputs.release_tag }}
+        run: |
+          set -eu
+          linux_package="mysql-${MYSQL_RELEASE_VERSION}-linux-arm64-uos20.tar.gz"
+          windows_package="mysql-${MYSQL_RELEASE_VERSION}-windows-x64.zip"
+          assets=(
+            "dist/linux-arm64-uos20/${linux_package}"
+            "dist/linux-arm64-uos20/${linux_package}.sha256"
+            "dist/windows-x64/${windows_package}"
+            "dist/windows-x64/${windows_package}.sha256"
+          )
+          for asset in "${assets[@]}"; do
+            test -f "$asset"
+          done
+
+          gh release create "$RELEASE_TAG" "${assets[@]}" \
+            --title "MySQL ${MYSQL_RELEASE_VERSION}" \
+            --generate-notes
+      - name: Validate generated release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MYSQL_RELEASE_VERSION: ${{ needs.validate-release-tag.outputs.mysql_version }}
+          RELEASE_TAG: ${{ needs.validate-release-tag.outputs.release_tag }}
+        run: |
+          set -eu
+          expected_assets=(
+            "mysql-${MYSQL_RELEASE_VERSION}-linux-arm64-uos20.tar.gz"
+            "mysql-${MYSQL_RELEASE_VERSION}-linux-arm64-uos20.tar.gz.sha256"
+            "mysql-${MYSQL_RELEASE_VERSION}-windows-x64.zip"
+            "mysql-${MYSQL_RELEASE_VERSION}-windows-x64.zip.sha256"
+          )
+          actual_assets="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+          for asset in "${expected_assets[@]}"; do
+            printf '%s\n' "$actual_assets" | grep -Fx -- "$asset" >/dev/null
+          done

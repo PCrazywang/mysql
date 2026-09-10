@@ -4,26 +4,12 @@ permissions:
   contents: read
 
 on:
-  push:
-    branches:
-      - master
-      - main
-    tags:
-      - 'v*'
-  pull_request:
-    branches:
-      - master
-      - main
-  workflow_dispatch:
+  workflow_call:
     inputs:
       mysql_version:
         description: 'MySQL version to build, for example 8.0.25'
         required: false
         type: string
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 env:
   MYSQL_VERSION: 8.0.25
@@ -500,68 +486,4 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
-
-  # Publish the verified artifact to a GitHub Release when a version tag (v*)
-  # is pushed. The Linux workflow publishes into the same tag; whichever job
-  # runs first creates the release, the other only uploads its own assets.
-  release:
-    name: Publish GitHub Release
-    needs: [windows-x64]
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Guard against mismatched version tags
-        id: guard
-        env:
-          INPUT_VERSION: ${{ inputs.mysql_version }}
-        run: |
-          set -eu
-          version="$MYSQL_VERSION"
-          if [ -n "${INPUT_VERSION:-}" ]; then
-            version="$INPUT_VERSION"
-          fi
-          tag="${GITHUB_REF#refs/tags/}"
-          case "$tag" in
-            "v${version}") ;;
-            *) echo "Tag '${tag}' does not match MySQL version '${version}'; refusing to publish." >&2; exit 1 ;;
-          esac
-          {
-            echo "package_name=mysql-${version}-${PACKAGE_PLATFORM}"
-            echo "release_tag=${tag}"
-          } >> "$GITHUB_OUTPUT"
-
-      - uses: actions/download-artifact@v7
-        with:
-          name: ${{ steps.guard.outputs.package_name }}
-          path: dist
-
-      - name: Create or update the GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          # gh resolves the target repository from the git remotes of the working
-          # directory, and this job deliberately has no actions/checkout. GH_REPO
-          # names it outright, so gh cannot fail with "unable to determine base
-          # repository" here.
-          GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ steps.guard.outputs.release_tag }}
-        run: |
-          set -eu
-          ls -lh dist
-          # The Linux workflow may publish into the same tag in parallel:
-          # create if missing, otherwise just attach this platform's assets.
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/* --clobber
-          else
-            gh release create "$RELEASE_TAG" dist/* \
-              --title "MySQL ${MYSQL_VERSION}" \
-              --notes "Automated release of MySQL ${MYSQL_VERSION}.
-
-            - Platform: ${PACKAGE_PLATFORM} (MSVC / VS 2022)
-            - See BUILD-ENVIRONMENT.txt inside the package."
-          fi
-          gh release view "$RELEASE_TAG" \
-            --json tagName,assets --jq '.tagName, (.assets[].name)'
 
